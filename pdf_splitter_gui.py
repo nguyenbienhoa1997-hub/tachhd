@@ -3,7 +3,6 @@ import re
 import sys
 import glob
 import queue
-import shutil
 import difflib
 import threading
 import unicodedata
@@ -12,21 +11,45 @@ from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import fitz  # PyMuPDF
 from PIL import Image
-from pypdf import PdfReader, PdfWriter
 import pytesseract
 
 INVALID_CHARS = r'<>:"/\|?*'
-HEADER_CROP = (0.0, 0.03, 1.0, 0.28)  # (left, top, right, bottom) as fraction of page size
 SIMILARITY_THRESHOLD = 0.75
-DEFAULT_LABEL = "ÔNG/BÀ"
 CODE_PATTERN = re.compile(r"SO\s*:?\s*(\d{3,})\s*/", re.IGNORECASE)
-OUTPUT_ROTATION_FIX = 180  # /Rotate metadata in these scans is off by 180 degrees
+RENDER_DPI = 150
+ROTATION_CANDIDATES = (0, 90, 180, 270)
+
+# Each document type defines: the region of the page to OCR (as a fraction box),
+# and a function that tries to pull a customer name out of the OCR'd text.
+DOCUMENT_TYPES = {
+    "hop_dong": {
+        "label": "Hợp đồng (ÔNG/BÀ ở đầu trang)",
+        "crop": (0.0, 0.03, 1.0, 0.28),
+        "default": True,
+    },
+    "phong_toa": {
+        "label": "Đề nghị phong tỏa chứng khoán (tên trong đoạn văn)",
+        "crop": (0.0, 0.03, 1.0, 0.45),
+        "default": True,
+    },
+}
+
+NAME_PATTERN_HOP_DONG = re.compile(
+    r"(?:Ô|O)NG\s*/\s*B(?:À|A)(?:\s*/\s*C(?:Ô|O)NG\s*TY)?\s*:\s*(.+)",
+    re.IGNORECASE,
+)
+NAME_PATTERN_PHONG_TOA = re.compile(
+    r"(?:Ô|O)ng\s*/\s*B(?:à|a)\s+(.+?)\s*[\(\"]",
+    re.IGNORECASE,
+)
 
 
 def strip_diacritics(text: str) -> str:
     text = unicodedata.normalize("NFD", text)
     return "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -70,25 +93,46 @@ def sanitize_filename(name: str) -> str:
     return name or "Khong_ten"
 
 
-def build_name_pattern(label: str) -> re.Pattern:
-    if label.strip().upper() == DEFAULT_LABEL:
-        return re.compile(
-            r"(?:Ô|O)NG\s*/\s*B(?:À|A)(?:\s*/\s*C(?:Ô|O)NG\s*TY)?\s*:\s*(.+)",
-            re.IGNORECASE,
-        )
-    return re.compile(re.escape(label.strip()) + r"\s*:?\s*(.+)", re.IGNORECASE)
+def clean_captured_name(found: str) -> str:
+    found = found.strip(" .:;,\"'()")
+    found = re.split(r"\s{2,}", found)[0]
+    found = re.split(r"[\d_|]", found)[0].strip(" .:;,\"'()-")
+    return found
 
 
-def extract_name_from_text(text: str, pattern: re.Pattern):
+def extract_name_hop_dong(text: str):
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        m = pattern.search(line)
+        m = NAME_PATTERN_HOP_DONG.search(line)
         if m:
-            found = m.group(1).strip(" .:;,\"'()")
-            found = re.split(r"\s{2,}", found)[0]
-            found = re.split(r"[\d_|]", found)[0].strip(" .:;,\"'()-")
+            found = clean_captured_name(m.group(1))
+            if found:
+                return found
+    return None
+
+
+def extract_name_phong_toa(text: str):
+    flat = text.replace("\n", " ")
+    m = NAME_PATTERN_PHONG_TOA.search(flat)
+    if m:
+        found = clean_captured_name(m.group(1))
+        if found:
+            return found
+    return None
+
+
+NAME_EXTRACTORS = {
+    "hop_dong": extract_name_hop_dong,
+    "phong_toa": extract_name_phong_toa,
+}
+
+
+def extract_name_multi(text: str, enabled_types):
+    for type_key in ("hop_dong", "phong_toa"):
+        if type_key in enabled_types:
+            found = NAME_EXTRACTORS[type_key](text)
             if found:
                 return found
     return None
@@ -101,17 +145,23 @@ def extract_code_from_text(text: str):
     return None
 
 
-def get_header_crop(page) -> Image.Image:
-    rotate = page.get("/Rotate", 0) or 0
-    img = None
-    for im in page.images:
-        img = im.image
-        break
-    if img is None:
-        raise ValueError("Trang không chứa ảnh (không phải file scan dạng ảnh).")
-    img = img.rotate(rotate, expand=True)
+def union_crop_box(enabled_types):
+    boxes = [DOCUMENT_TYPES[t]["crop"] for t in enabled_types if t in DOCUMENT_TYPES]
+    if not boxes:
+        boxes = [DOCUMENT_TYPES["hop_dong"]["crop"]]
+    lefts, tops, rights, bottoms = zip(*boxes)
+    return (min(lefts), min(tops), max(rights), max(bottoms))
+
+
+def render_page_image(page, angle) -> Image.Image:
+    page.set_rotation(angle)
+    pix = page.get_pixmap(dpi=RENDER_DPI)
+    return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+
+def crop_fraction(img: Image.Image, box) -> Image.Image:
+    left, top, right, bottom = box
     w, h = img.size
-    left, top, right, bottom = HEADER_CROP
     return img.crop((int(w * left), int(h * top), int(w * right), int(h * bottom)))
 
 
@@ -119,110 +169,182 @@ def ocr_image(img: Image.Image) -> str:
     return pytesseract.image_to_string(img, lang="vie", config="--psm 6")
 
 
+def ocr_with_confidence(img: Image.Image):
+    """OCR the image once, returning (text, mean_word_confidence).
+
+    Confidence (not just word count) is what reliably tells a correctly
+    oriented page apart from an upside-down/sideways one: garbled text from
+    the wrong rotation can still contain plenty of short word-shaped
+    fragments, but Tesseract's own confidence on them is low.
+    """
+    data = pytesseract.image_to_data(
+        img, lang="vie", config="--psm 6", output_type=pytesseract.Output.DICT
+    )
+    lines = {}
+    confs = []
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+        if not word:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        lines.setdefault(key, []).append(word)
+        try:
+            conf_val = int(float(data["conf"][i]))
+        except (ValueError, TypeError):
+            conf_val = -1
+        if conf_val >= 0:
+            confs.append(conf_val)
+    text = "\n".join(" ".join(words) for words in lines.values())
+    avg_conf = sum(confs) / len(confs) if confs else -1.0
+    return text, avg_conf
+
+
+def detect_rotation_family(page, crop_box):
+    """Find which pair of opposite angles (0/180 or 90/270) reads correctly for this page."""
+    best_angle, best_conf = 0, -1.0
+    for angle in ROTATION_CANDIDATES:
+        img = render_page_image(page, angle)
+        crop = crop_fraction(img, crop_box)
+        _, conf = ocr_with_confidence(crop)
+        if conf > best_conf:
+            best_conf, best_angle = conf, angle
+    return (best_angle, (best_angle + 180) % 360)
+
+
 class PdfSplitter:
-    def __init__(self, file_paths, output_dir, label, log, progress_cb, max_workers=6):
+    def __init__(self, file_paths, output_dir, enabled_types, log, progress_cb, max_workers=6, code_only=False):
         self.file_paths = file_paths
         self.output_dir = output_dir
-        self.pattern = build_name_pattern(label)
+        self.enabled_types = enabled_types
+        self.code_only = code_only
+        self.crop_box = union_crop_box(enabled_types) if enabled_types else DOCUMENT_TYPES["hop_dong"]["crop"]
         self.log = log
         self.progress_cb = progress_cb
         self.max_workers = max_workers
 
-        self.readers = {}
-        self.groups = {}  # canonical_name -> list of parts; part = list of (file_path, page_index)
-        self.codes = {}  # canonical_name -> mã HĐ (dossier code)
-        self.order = []
-        self.current_canonical = None
-        self.current_normalized = None
-        self.current_part = []
+        self.docs = {}
+        self.page_angles = {}  # (file_path, page_index) -> chosen rotation angle
+        self.finished_groups = []  # list of {"code","name","pages":[(file_path,page_index),...]}
+        self.current_group = None
         self.unknown_pages = []
 
-    def get_reader(self, path):
-        if path not in self.readers:
-            self.readers[path] = PdfReader(path)
-        return self.readers[path]
+    def get_doc(self, path):
+        if path not in self.docs:
+            self.docs[path] = fitz.open(path)
+        return self.docs[path]
 
-    def close_current_part(self):
-        if self.current_canonical is not None and self.current_part:
-            self.groups[self.current_canonical].append(self.current_part)
-        self.current_part = []
+    def close_current_group(self):
+        if self.current_group is not None and self.current_group["pages"]:
+            self.finished_groups.append(self.current_group)
+        self.current_group = None
 
     def handle_page(self, file_path, page_index, text):
-        found_name = extract_name_from_text(text, self.pattern)
+        found_code = extract_code_from_text(text)
+        found_name = None if self.code_only else extract_name_multi(text, self.enabled_types)
 
-        if found_name:
-            found_code = extract_code_from_text(text)
-            normalized_found = normalize_name(found_name)
-            same_customer = self.current_canonical is not None and (
-                normalized_found == self.current_normalized
-                or is_similar(normalized_found, self.current_normalized)
-            )
-            self.close_current_part()
-
-            if same_customer:
-                if found_code and not self.codes.get(self.current_canonical):
-                    self.codes[self.current_canonical] = found_code
+        is_new = False
+        if self.code_only:
+            if self.current_group is None:
+                is_new = bool(found_code)
             else:
-                canonical = found_name.strip()
-                if canonical not in self.groups:
-                    self.groups[canonical] = []
-                    self.order.append(canonical)
-                    self.codes[canonical] = found_code
-                self.current_canonical = canonical
-                self.current_normalized = normalized_found
-
-            self.current_part = [(file_path, page_index)]
+                cur_code = self.current_group["code"]
+                if found_code and cur_code and found_code != cur_code:
+                    is_new = True
+        elif self.current_group is None:
+            is_new = bool(found_code or found_name)
         else:
-            if self.current_canonical is None:
-                self.unknown_pages.append((file_path, page_index))
-            else:
-                self.current_part.append((file_path, page_index))
+            cur_code = self.current_group["code"]
+            cur_name = self.current_group["name"]
+            if found_code and cur_code and found_code != cur_code:
+                is_new = True
+            elif found_name and cur_name:
+                nf = normalize_name(found_name)
+                cn = normalize_name(cur_name)
+                same_code = found_code and cur_code and found_code == cur_code
+                if nf != cn and not is_similar(nf, cn) and not same_code:
+                    is_new = True
+
+        if is_new:
+            self.close_current_group()
+            self.current_group = {"code": found_code, "name": found_name, "pages": []}
+        elif self.current_group is not None:
+            if found_code and not self.current_group["code"]:
+                self.current_group["code"] = found_code
+            if found_name and not self.current_group["name"]:
+                self.current_group["name"] = found_name
+
+        if self.current_group is None:
+            self.unknown_pages.append((file_path, page_index))
+        else:
+            self.current_group["pages"].append((file_path, page_index))
 
     def scan(self):
         total_pages = 0
         page_counts = {}
         for path in self.file_paths:
-            reader = self.get_reader(path)
-            n = len(reader.pages)
-            page_counts[path] = n
-            total_pages += n
+            doc = self.get_doc(path)
+            page_counts[path] = doc.page_count
+            total_pages += doc.page_count
         self.log(f"Tổng số trang cần xử lý: {total_pages} (trong {len(self.file_paths)} file)")
 
         done = 0
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             for path in self.file_paths:
-                reader = self.get_reader(path)
+                doc = self.get_doc(path)
                 n = page_counts[path]
-                self.log(f"Đang đọc ảnh trang: {os.path.basename(path)} ({n} trang)...")
+                self.log(f"Đang dò góc xoay: {os.path.basename(path)}...")
+                family = detect_rotation_family(doc[0], self.crop_box)
+                self.log(
+                    f"  -> góc xoay dùng cho file này: {family[0]}° hoặc {family[1]}° "
+                    f"(tự động chọn theo từng trang)"
+                )
 
-                crops = []
+                # PyMuPDF is not thread-safe for concurrent rendering on the same
+                # Document, so render every candidate crop sequentially first...
+                jobs = []  # (page_index, candidate_index, image)
                 for i in range(n):
-                    try:
-                        crops.append(get_header_crop(reader.pages[i]))
-                    except Exception as e:
-                        self.log(f"Cảnh báo trang {i + 1} ({os.path.basename(path)}): {e}")
-                        crops.append(Image.new("L", (10, 10), 255))
+                    for ci, angle in enumerate(family):
+                        img = render_page_image(doc[i], angle)
+                        jobs.append((i, ci, crop_fraction(img, self.crop_box)))
 
-                texts = list(pool.map(ocr_image, crops))
+                # ...then run the actual OCR (external tesseract processes) in parallel.
+                def run_ocr(job):
+                    i, ci, img = job
+                    text, conf = ocr_with_confidence(img)
+                    return i, ci, text, conf
 
-                for i, text in enumerate(texts):
+                ocr_results = pool.map(run_ocr, jobs)
+
+                best_per_page = {}
+                for i, ci, text, conf in ocr_results:
+                    current = best_per_page.get(i)
+                    if current is None or conf > current[0]:
+                        best_per_page[i] = (conf, ci, text)
+
+                for i in range(n):
+                    _, ci, text = best_per_page[i]
+                    angle = family[ci]
+                    self.page_angles[(path, i)] = angle
                     self.handle_page(path, i, text)
                     done += 1
                     if done % 10 == 0 or done == total_pages:
                         self.progress_cb(done, total_pages)
                         self.log(f"Đã xử lý {done}/{total_pages} trang...")
 
-        self.close_current_part()
+        self.close_current_group()
         return total_pages
 
     def write_outputs(self):
         used_folder_names = {}
         summary_lines = []
 
-        for canonical in self.order:
-            parts = self.groups[canonical]
-            code = self.codes.get(canonical)
-            label = f"{code} {canonical}" if code else canonical
+        for group in self.finished_groups:
+            if self.code_only:
+                label = group["code"] or "Khong_ma"
+            else:
+                name = group["name"] or "Khong_ten"
+                code = group["code"]
+                label = f"{code} {name}" if code else name
 
             folder_name = sanitize_filename(label)
             count = used_folder_names.get(folder_name, 0)
@@ -232,50 +354,50 @@ class PdfSplitter:
             customer_dir = os.path.join(self.output_dir, display_folder)
             os.makedirs(customer_dir, exist_ok=True)
 
-            total_customer_pages = sum(len(p) for p in parts)
-            summary_lines.append(f"{label}: {len(parts)} tài liệu, {total_customer_pages} trang")
-
-            writer = PdfWriter()
-            for part_pages in parts:
-                for file_path, page_index in part_pages:
-                    reader = self.get_reader(file_path)
-                    page = reader.pages[page_index]
-                    page.rotate(OUTPUT_ROTATION_FIX)
-                    page.transfer_rotation_to_content()
-                    writer.add_page(page)
+            out_doc = fitz.open()
+            for file_path, page_index in group["pages"]:
+                src_doc = self.get_doc(file_path)
+                angle = self.page_angles.get((file_path, page_index), src_doc[page_index].rotation)
+                src_doc[page_index].set_rotation(angle)
+                out_doc.insert_pdf(src_doc, from_page=page_index, to_page=page_index)
 
             out_path = os.path.join(customer_dir, f"{display_folder}.pdf")
-            with open(out_path, "wb") as f:
-                writer.write(f)
-            self.log(f"Đã tạo: {out_path} ({total_customer_pages} trang)")
+            out_doc.save(out_path)
+            out_doc.close()
+
+            summary_lines.append(f"{label}: {len(group['pages'])} trang")
+            self.log(f"Đã tạo: {out_path} ({len(group['pages'])} trang)")
 
         if self.unknown_pages:
             unknown_dir = os.path.join(self.output_dir, "Khong_xac_dinh")
             os.makedirs(unknown_dir, exist_ok=True)
-            writer = PdfWriter()
+            out_doc = fitz.open()
             for file_path, page_index in self.unknown_pages:
-                reader = self.get_reader(file_path)
-                page = reader.pages[page_index]
-                page.transfer_rotation_to_content()
-                writer.add_page(page)
+                src_doc = self.get_doc(file_path)
+                angle = self.page_angles.get((file_path, page_index), src_doc[page_index].rotation)
+                src_doc[page_index].set_rotation(angle)
+                out_doc.insert_pdf(src_doc, from_page=page_index, to_page=page_index)
             out_path = os.path.join(unknown_dir, "Khong_xac_dinh.pdf")
-            with open(out_path, "wb") as f:
-                writer.write(f)
+            out_doc.save(out_path)
+            out_doc.close()
             summary_lines.append(
-                f"Không xác định: {len(self.unknown_pages)} trang (không tìm thấy tên trước trang này)"
+                f"Không xác định: {len(self.unknown_pages)} trang (không tìm thấy mã/tên trước trang này)"
             )
             self.log(
-                f"Cảnh báo: {len(self.unknown_pages)} trang không tìm thấy tên khách hàng, "
+                f"Cảnh báo: {len(self.unknown_pages)} trang không tìm thấy mã/tên khách hàng, "
                 f"đã lưu tại: {out_path}"
             )
 
         summary_path = os.path.join(self.output_dir, "BaoCao_TachFile.txt")
         with open(summary_path, "w", encoding="utf-8") as f:
-            f.write(f"Tổng số khách hàng: {len(self.order)}\n\n")
+            f.write(f"Tổng số khách hàng: {len(self.finished_groups)}\n\n")
             f.write("\n".join(summary_lines))
         self.log(f"Đã ghi báo cáo: {summary_path}")
 
-        return len(self.order)
+        for doc in self.docs.values():
+            doc.close()
+
+        return len(self.finished_groups)
 
 
 def find_pdf_files(folder: str):
@@ -284,11 +406,20 @@ def find_pdf_files(folder: str):
     return files
 
 
+APP_TITLE = "Hòa Đã Lấy Vợ"
+
+
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Tách PDF theo khách hàng (OCR)")
-        root.geometry("720x560")
+        root.title(APP_TITLE)
+        root.geometry("720x620")
+        icon_path = os.path.join(BASE_DIR, "app_icon.ico")
+        if os.path.isfile(icon_path):
+            try:
+                root.iconbitmap(icon_path)
+            except tk.TclError:
+                pass
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
 
@@ -312,13 +443,33 @@ class App:
 
         frame.columnconfigure(1, weight=1)
 
+        type_frame = ttk.LabelFrame(root, text="Loại tài liệu cần nhận diện")
+        type_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.type_vars = {}
+        self.type_checkbuttons = []
+        for key, cfg in DOCUMENT_TYPES.items():
+            var = tk.BooleanVar(value=cfg["default"])
+            cb = ttk.Checkbutton(type_frame, text=cfg["label"], variable=var)
+            cb.pack(anchor="w", padx=8, pady=2)
+            self.type_vars[key] = var
+            self.type_checkbuttons.append(cb)
+
+        ttk.Separator(type_frame).pack(fill="x", padx=8, pady=4)
+        self.code_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            type_frame,
+            text="Chỉ tách theo mã HĐ (bỏ qua so khớp tên, dùng khi không chắc mẫu tên)",
+            variable=self.code_only_var,
+            command=self.on_code_only_toggle,
+        ).pack(anchor="w", padx=8, pady=(2, 6))
+
         self.start_btn = ttk.Button(root, text="Bắt đầu tách", command=self.start)
         self.start_btn.pack(pady=8)
 
         self.progress = ttk.Progressbar(root, mode="determinate")
         self.progress.pack(fill="x", padx=10, pady=(0, 8))
 
-        self.log_box = tk.Text(root, height=22, state="disabled")
+        self.log_box = tk.Text(root, height=20, state="disabled")
         self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         self.root.after(100, self.poll_log)
@@ -368,6 +519,11 @@ class App:
         self.progress["maximum"] = total
         self.progress["value"] = done
 
+    def on_code_only_toggle(self):
+        state = "disabled" if self.code_only_var.get() else "normal"
+        for cb in self.type_checkbuttons:
+            cb.configure(state=state)
+
     def start(self):
         if not os.path.isfile(pytesseract.pytesseract.tesseract_cmd or ""):
             messagebox.showerror(
@@ -378,7 +534,8 @@ class App:
             return
 
         output_dir = self.output_var.get().strip()
-        label = DEFAULT_LABEL
+        code_only = self.code_only_var.get()
+        enabled_types = [k for k, v in self.type_vars.items() if v.get()]
 
         files = self.selected_files
         if not files:
@@ -387,6 +544,9 @@ class App:
         if not output_dir:
             messagebox.showerror("Lỗi", "Vui lòng chọn thư mục lưu kết quả.")
             return
+        if not code_only and not enabled_types:
+            messagebox.showerror("Lỗi", "Vui lòng chọn ít nhất 1 loại tài liệu cần nhận diện.")
+            return
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -394,13 +554,15 @@ class App:
         self.log(f"Tìm thấy {len(files)} file PDF: " + ", ".join(os.path.basename(f) for f in files))
 
         thread = threading.Thread(
-            target=self.run_split, args=(files, output_dir, label), daemon=True
+            target=self.run_split, args=(files, output_dir, enabled_types, code_only), daemon=True
         )
         thread.start()
 
-    def run_split(self, files, output_dir, label):
+    def run_split(self, files, output_dir, enabled_types, code_only):
         try:
-            splitter = PdfSplitter(files, output_dir, label, self.log, self.set_progress)
+            splitter = PdfSplitter(
+                files, output_dir, enabled_types, self.log, self.set_progress, code_only=code_only
+            )
             splitter.scan()
             self.log("Đang ghi các file kết quả...")
             num_customers = splitter.write_outputs()
