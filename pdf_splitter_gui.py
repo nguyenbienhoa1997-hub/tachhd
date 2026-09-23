@@ -25,8 +25,8 @@ ROTATION_CANDIDATES = (0, 90, 180, 270)
 # and a function that tries to pull a customer name out of the OCR'd text.
 DOCUMENT_TYPES = {
     "hop_dong": {
-        "label": "Hợp đồng (ÔNG/BÀ ở đầu trang)",
-        "crop": (0.0, 0.03, 1.0, 0.28),
+        "label": "Hợp đồng / đề nghị (nhãn + tên ở đầu trang)",
+        "crop": (0.0, 0.03, 1.0, 0.65),
         "default": True,
     },
     "phong_toa": {
@@ -36,10 +36,21 @@ DOCUMENT_TYPES = {
     },
 }
 
-NAME_PATTERN_HOP_DONG = re.compile(
-    r"(?:Ô|O)NG\s*/\s*B(?:À|A)(?:\s*/\s*C(?:Ô|O)NG\s*TY)?\s*:\s*(.+)",
-    re.IGNORECASE,
-)
+# Different templates label the customer's name differently on page 1:
+#   "ÔNG/BÀ: TÊN"                              (hợp đồng thế chấp/vay vốn)
+#   "BÊN NHẬN BẢO ĐẢM ("..."): TÊN"            (đề nghị phong tỏa, mẫu 01K/PT)
+# Both are "label (+ optional parenthetical) : name" on one line, so they're
+# tried together as the "hop_dong" document type.
+NAME_PATTERNS_HOP_DONG = [
+    re.compile(
+        r"(?:Ô|O)NG\s*/\s*B(?:À|A)(?:\s*/\s*C(?:Ô|O)NG\s*TY)?\s*:\s*(.+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"B[ÊE]N\s+NH[ẬA]N\s+[^:()\n]{2,30}\([^)\n]*\)\s*:\s*(.+)",
+        re.IGNORECASE,
+    ),
+]
 NAME_PATTERN_PHONG_TOA = re.compile(
     r"(?:Ô|O)ng\s*/\s*B(?:à|a)\s+(.+?)\s*[\(\"]",
     re.IGNORECASE,
@@ -105,11 +116,12 @@ def extract_name_hop_dong(text: str):
         line = line.strip()
         if not line:
             continue
-        m = NAME_PATTERN_HOP_DONG.search(line)
-        if m:
-            found = clean_captured_name(m.group(1))
-            if found:
-                return found
+        for pattern in NAME_PATTERNS_HOP_DONG:
+            m = pattern.search(line)
+            if m:
+                found = clean_captured_name(m.group(1))
+                if found:
+                    return found
     return None
 
 
@@ -136,6 +148,15 @@ def extract_name_multi(text: str, enabled_types):
             if found:
                 return found
     return None
+
+
+def codes_probably_same(a, b):
+    """True if two dossier codes are equal or differ by only one OCR-mistaken digit."""
+    if a == b:
+        return True
+    if len(a) != len(b):
+        return False
+    return sum(1 for x, y in zip(a, b) if x != y) <= 1
 
 
 def extract_code_from_text(text: str):
@@ -224,8 +245,10 @@ class PdfSplitter:
 
         self.docs = {}
         self.page_angles = {}  # (file_path, page_index) -> chosen rotation angle
-        self.finished_groups = []  # list of {"code","name","pages":[(file_path,page_index),...]}
-        self.current_group = None
+        self.records = []  # [{"file","idx","code","name"}, ...] in scan order, before grouping
+        self.groups = []  # list of {"code","name","pages":[(file_path,page_index),...]}, in first-seen order
+        self.groups_by_code = {}  # code -> group
+        self.current_group = None  # where pages with no code/name of their own get appended
         self.unknown_pages = []
 
     def get_doc(self, path):
@@ -233,50 +256,62 @@ class PdfSplitter:
             self.docs[path] = fitz.open(path)
         return self.docs[path]
 
-    def close_current_group(self):
-        if self.current_group is not None and self.current_group["pages"]:
-            self.finished_groups.append(self.current_group)
-        self.current_group = None
+    def find_group_by_name(self, found_name):
+        nf = normalize_name(found_name)
+        for g in self.groups:
+            if g["name"] and (normalize_name(g["name"]) == nf or is_similar(nf, normalize_name(g["name"]))):
+                return g
+        return None
 
-    def handle_page(self, file_path, page_index, text):
-        found_code = extract_code_from_text(text)
-        found_name = None if self.code_only else extract_name_multi(text, self.enabled_types)
+    def resolve_forward_names(self, lookahead=3):
+        """A page can show a document's code without its name (name follows a
+        page or two later). Borrow that upcoming name so the boundary/merge
+        decision for the code-only page doesn't wrongly start a fresh group."""
+        n = len(self.records)
+        for i in range(n):
+            my_code = self.records[i]["code"]
+            # Only pages that already show a code of their own are worth resolving —
+            # a page with neither code nor name is just a generic continuation page
+            # and should stay attached to whatever group precedes it, not borrow a
+            # name from further ahead (which could belong to the next document).
+            if self.records[i]["name"] or not my_code:
+                continue
+            for j in range(i + 1, min(i + 1 + lookahead, n)):
+                other_code = self.records[j]["code"]
+                if other_code and not codes_probably_same(other_code, my_code):
+                    break
+                if self.records[j]["name"]:
+                    self.records[i]["name"] = self.records[j]["name"]
+                    break
 
-        is_new = False
-        if self.code_only:
-            if self.current_group is None:
-                is_new = bool(found_code)
-            else:
-                cur_code = self.current_group["code"]
-                if found_code and cur_code and found_code != cur_code:
-                    is_new = True
-        elif self.current_group is None:
-            is_new = bool(found_code or found_name)
-        else:
-            cur_code = self.current_group["code"]
-            cur_name = self.current_group["name"]
-            if found_code and cur_code and found_code != cur_code:
-                is_new = True
-            elif found_name and cur_name:
-                nf = normalize_name(found_name)
-                cn = normalize_name(cur_name)
-                same_code = found_code and cur_code and found_code == cur_code
-                if nf != cn and not is_similar(nf, cn) and not same_code:
-                    is_new = True
+    def assign_page(self, file_path, page_index, found_code, found_name):
+        target_group = None
+        if found_code:
+            target_group = self.groups_by_code.get(found_code)
+        if target_group is None and found_name:
+            # Same customer can recur far apart in the batch (a mortgage contract and,
+            # much later, an unrelated securities-freeze request), and a code can be
+            # misread by OCR (e.g. a 9 read as a 0) — matching by name catches both.
+            target_group = self.find_group_by_name(found_name)
 
-        if is_new:
-            self.close_current_group()
-            self.current_group = {"code": found_code, "name": found_name, "pages": []}
+        if target_group is None and (found_code or found_name):
+            target_group = {"code": found_code, "name": found_name, "pages": []}
+            self.groups.append(target_group)
+            if found_code:
+                self.groups_by_code[found_code] = target_group
+
+        if target_group is not None:
+            if found_code and not target_group["code"]:
+                target_group["code"] = found_code
+                self.groups_by_code[found_code] = target_group
+            if found_name and not target_group["name"]:
+                target_group["name"] = found_name
+            target_group["pages"].append((file_path, page_index))
+            self.current_group = target_group
         elif self.current_group is not None:
-            if found_code and not self.current_group["code"]:
-                self.current_group["code"] = found_code
-            if found_name and not self.current_group["name"]:
-                self.current_group["name"] = found_name
-
-        if self.current_group is None:
-            self.unknown_pages.append((file_path, page_index))
-        else:
             self.current_group["pages"].append((file_path, page_index))
+        else:
+            self.unknown_pages.append((file_path, page_index))
 
     def scan(self):
         total_pages = 0
@@ -325,20 +360,25 @@ class PdfSplitter:
                     _, ci, text = best_per_page[i]
                     angle = family[ci]
                     self.page_angles[(path, i)] = angle
-                    self.handle_page(path, i, text)
+                    found_code = extract_code_from_text(text)
+                    found_name = None if self.code_only else extract_name_multi(text, self.enabled_types)
+                    self.records.append({"file": path, "idx": i, "code": found_code, "name": found_name})
                     done += 1
                     if done % 10 == 0 or done == total_pages:
                         self.progress_cb(done, total_pages)
                         self.log(f"Đã xử lý {done}/{total_pages} trang...")
 
-        self.close_current_group()
+        self.resolve_forward_names()
+        for rec in self.records:
+            self.assign_page(rec["file"], rec["idx"], rec["code"], rec["name"])
+
         return total_pages
 
     def write_outputs(self):
         used_folder_names = {}
         summary_lines = []
 
-        for group in self.finished_groups:
+        for group in self.groups:
             if self.code_only:
                 label = group["code"] or "Khong_ma"
             else:
@@ -390,14 +430,14 @@ class PdfSplitter:
 
         summary_path = os.path.join(self.output_dir, "BaoCao_TachFile.txt")
         with open(summary_path, "w", encoding="utf-8") as f:
-            f.write(f"Tổng số khách hàng: {len(self.finished_groups)}\n\n")
+            f.write(f"Tổng số khách hàng: {len(self.groups)}\n\n")
             f.write("\n".join(summary_lines))
         self.log(f"Đã ghi báo cáo: {summary_path}")
 
         for doc in self.docs.values():
             doc.close()
 
-        return len(self.finished_groups)
+        return len(self.groups)
 
 
 def find_pdf_files(folder: str):
