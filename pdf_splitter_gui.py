@@ -106,7 +106,14 @@ def clean_captured_name(found: str) -> str:
     found = found.strip(" .:;,\"'()")
     found = re.split(r"\s{2,}", found)[0]
     found = re.split(r"[\d_|]", found)[0].strip(" .:;,\"'()-")
-    return found
+    # A stray mark on the page (stamp edge, pen stroke, fold...) sometimes OCRs
+    # as one extra bogus single letter tacked onto the end of the name (e.g.
+    # "PHẠM THỊ THANH HƯƠNG Ĩ"). Drop it so this doesn't read as a different
+    # person than the same name read cleanly on another page.
+    words = found.split()
+    if len(words) >= 3 and len(words[-1]) <= 1:
+        words = words[:-1]
+    return " ".join(words)
 
 
 def extract_name_hop_dong(text: str):
