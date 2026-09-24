@@ -3,7 +3,6 @@ import re
 import sys
 import glob
 import queue
-import difflib
 import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +15,6 @@ from PIL import Image
 import pytesseract
 
 INVALID_CHARS = r'<>:"/\|?*'
-SIMILARITY_THRESHOLD = 0.75
 CODE_PATTERN = re.compile(r"SO\s*:?\s*(\d{3,})\s*/", re.IGNORECASE)
 RENDER_DPI = 150
 ROTATION_CANDIDATES = (0, 90, 180, 270)
@@ -88,12 +86,6 @@ def normalize_name(name: str) -> str:
     name = strip_diacritics(name.strip().upper())
     name = re.sub(r"\s+", " ", name)
     return name.strip()
-
-
-def is_similar(a_norm: str, b_norm: str) -> bool:
-    if not a_norm or not b_norm:
-        return False
-    return difflib.SequenceMatcher(None, a_norm, b_norm).ratio() >= SIMILARITY_THRESHOLD
 
 
 def sanitize_filename(name: str) -> str:
@@ -259,7 +251,7 @@ class PdfSplitter:
     def find_group_by_name(self, found_name):
         nf = normalize_name(found_name)
         for g in self.groups:
-            if g["name"] and (normalize_name(g["name"]) == nf or is_similar(nf, normalize_name(g["name"]))):
+            if g["name"] and normalize_name(g["name"]) == nf:
                 return g
         return None
 
