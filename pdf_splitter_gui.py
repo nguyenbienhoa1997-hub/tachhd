@@ -6,7 +6,7 @@ import glob
 import queue
 import threading
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -225,16 +225,21 @@ def detect_rotation_family(page, crop_box):
     return (best_angle, (best_angle + 180) % 360)
 
 
+class Cancelled(Exception):
+    pass
+
+
 class PdfSplitter:
     def __init__(
         self, file_paths, output_dir, enabled_types, log, progress_cb,
-        max_workers=6, code_only=False, create_folders=True,
+        max_workers=6, code_only=False, create_folders=True, is_cancelled=None,
     ):
         self.file_paths = file_paths
         self.output_dir = output_dir
         self.enabled_types = enabled_types
         self.code_only = code_only
         self.create_folders = create_folders
+        self.is_cancelled = is_cancelled or (lambda: False)
         self.crop_box = union_crop_box(enabled_types) if enabled_types else DOCUMENT_TYPES["hop_dong"]["crop"]
         self.log = log
         self.progress_cb = progress_cb
@@ -322,6 +327,9 @@ class PdfSplitter:
         done = 0
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             for path in self.file_paths:
+                if self.is_cancelled():
+                    raise Cancelled()
+
                 doc = self.get_doc(path)
                 n = page_counts[path]
                 self.log(f"Đang dò góc xoay: {os.path.basename(path)}...")
@@ -339,16 +347,22 @@ class PdfSplitter:
                         img = render_page_image(doc[i], angle)
                         jobs.append((i, ci, crop_fraction(img, self.crop_box)))
 
-                # ...then run the actual OCR (external tesseract processes) in parallel.
+                # ...then run the actual OCR (external tesseract processes) in parallel,
+                # checking for cancellation as results trickle in so a "Hủy" click
+                # doesn't have to wait for the whole file to finish OCR-ing.
                 def run_ocr(job):
                     i, ci, img = job
                     text, conf = ocr_with_confidence(img)
                     return i, ci, text, conf
 
-                ocr_results = pool.map(run_ocr, jobs)
-
+                futures = [pool.submit(run_ocr, job) for job in jobs]
                 best_per_page = {}
-                for i, ci, text, conf in ocr_results:
+                for future in as_completed(futures):
+                    if self.is_cancelled():
+                        for f in futures:
+                            f.cancel()
+                        raise Cancelled()
+                    i, ci, text, conf = future.result()
                     current = best_per_page.get(i)
                     if current is None or conf > current[0]:
                         best_per_page[i] = (conf, ci, text)
@@ -376,6 +390,8 @@ class PdfSplitter:
         summary_lines = []
 
         for group in self.groups:
+            if self.is_cancelled():
+                raise Cancelled()
             if self.code_only:
                 label = group["code"] or "Khong_ma"
             else:
@@ -517,6 +533,8 @@ class App:
         control_frame.pack(pady=8)
         self.start_btn = ttk.Button(control_frame, text="Bắt đầu tách", command=self.start)
         self.start_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(control_frame, text="Hủy", command=self.cancel, state="disabled")
+        self.cancel_btn.pack(side="left", padx=(8, 0))
         self.timer_var = tk.StringVar(value="00:00:00")
         ttk.Label(control_frame, textvariable=self.timer_var, font=("Consolas", 11)).pack(side="left", padx=(12, 0))
 
@@ -529,6 +547,7 @@ class App:
 
         self.timer_running = False
         self.start_time = None
+        self.cancel_event = threading.Event()
 
         self.log_box = tk.Text(root, height=20, state="disabled")
         self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -631,6 +650,8 @@ class App:
         os.makedirs(output_dir, exist_ok=True)
 
         self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.cancel_event.clear()
         self.log(f"Tìm thấy {len(files)} file PDF: " + ", ".join(os.path.basename(f) for f in files))
         self.start_timer()
 
@@ -640,11 +661,17 @@ class App:
         )
         thread.start()
 
+    def cancel(self):
+        self.cancel_event.set()
+        self.cancel_btn.configure(state="disabled")
+        self.log("Đang hủy... (chờ xử lý xong trang/nhóm đang dở)")
+
     def run_split(self, files, output_dir, enabled_types, code_only, create_folders):
         try:
             splitter = PdfSplitter(
                 files, output_dir, enabled_types, self.log, self.set_progress,
                 code_only=code_only, create_folders=create_folders,
+                is_cancelled=self.cancel_event.is_set,
             )
             splitter.scan()
             self.log("Đang ghi các file kết quả...")
@@ -653,12 +680,16 @@ class App:
             self.root.after(0, lambda: messagebox.showinfo(
                 "Xong", f"Đã tách thành {num_customers} khách hàng.\nLưu tại: {output_dir}"
             ))
+        except Cancelled:
+            self.log("Đã hủy theo yêu cầu.")
+            self.root.after(0, lambda: messagebox.showinfo("Đã hủy", "Đã hủy quá trình tách file."))
         except Exception as e:
             self.log(f"Lỗi: {e}")
             self.root.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
         finally:
             self.root.after(0, self.stop_timer)
             self.root.after(0, lambda: self.start_btn.configure(state="normal"))
+            self.root.after(0, lambda: self.cancel_btn.configure(state="disabled"))
 
 
 if __name__ == "__main__":
