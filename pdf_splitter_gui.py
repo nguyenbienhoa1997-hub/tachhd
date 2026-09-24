@@ -225,11 +225,15 @@ def detect_rotation_family(page, crop_box):
 
 
 class PdfSplitter:
-    def __init__(self, file_paths, output_dir, enabled_types, log, progress_cb, max_workers=6, code_only=False):
+    def __init__(
+        self, file_paths, output_dir, enabled_types, log, progress_cb,
+        max_workers=6, code_only=False, create_folders=True,
+    ):
         self.file_paths = file_paths
         self.output_dir = output_dir
         self.enabled_types = enabled_types
         self.code_only = code_only
+        self.create_folders = create_folders
         self.crop_box = union_crop_box(enabled_types) if enabled_types else DOCUMENT_TYPES["hop_dong"]["crop"]
         self.log = log
         self.progress_cb = progress_cb
@@ -378,13 +382,16 @@ class PdfSplitter:
                 code = group["code"]
                 label = f"{code} {name}" if code else name
 
-            folder_name = sanitize_filename(label)
-            count = used_folder_names.get(folder_name, 0)
-            used_folder_names[folder_name] = count + 1
-            display_folder = folder_name if count == 0 else f"{folder_name} ({count + 1})"
+            base_name = sanitize_filename(label)
+            count = used_folder_names.get(base_name, 0)
+            used_folder_names[base_name] = count + 1
+            display_name = base_name if count == 0 else f"{base_name} ({count + 1})"
 
-            customer_dir = os.path.join(self.output_dir, display_folder)
-            os.makedirs(customer_dir, exist_ok=True)
+            if self.create_folders:
+                target_dir = os.path.join(self.output_dir, display_name)
+                os.makedirs(target_dir, exist_ok=True)
+            else:
+                target_dir = self.output_dir
 
             out_doc = fitz.open()
             for file_path, page_index in group["pages"]:
@@ -393,7 +400,7 @@ class PdfSplitter:
                 src_doc[page_index].set_rotation(angle)
                 out_doc.insert_pdf(src_doc, from_page=page_index, to_page=page_index)
 
-            out_path = os.path.join(customer_dir, f"{display_folder}.pdf")
+            out_path = os.path.join(target_dir, f"{display_name}.pdf")
             out_doc.save(out_path)
             out_doc.close()
 
@@ -401,8 +408,11 @@ class PdfSplitter:
             self.log(f"Đã tạo: {out_path} ({len(group['pages'])} trang)")
 
         if self.unknown_pages:
-            unknown_dir = os.path.join(self.output_dir, "Khong_xac_dinh")
-            os.makedirs(unknown_dir, exist_ok=True)
+            if self.create_folders:
+                unknown_dir = os.path.join(self.output_dir, "Khong_xac_dinh")
+                os.makedirs(unknown_dir, exist_ok=True)
+            else:
+                unknown_dir = self.output_dir
             out_doc = fitz.open()
             for file_path, page_index in self.unknown_pages:
                 src_doc = self.get_doc(file_path)
@@ -493,6 +503,13 @@ class App:
             text="Chỉ tách theo mã HĐ (bỏ qua so khớp tên, dùng khi không chắc mẫu tên)",
             variable=self.code_only_var,
             command=self.on_code_only_toggle,
+        ).pack(anchor="w", padx=8, pady=(2, 2))
+
+        self.create_folders_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            type_frame,
+            text="Tạo folder riêng cho mỗi khách hàng (bỏ tích = xuất thẳng file PDF, không tạo folder)",
+            variable=self.create_folders_var,
         ).pack(anchor="w", padx=8, pady=(2, 6))
 
         self.start_btn = ttk.Button(root, text="Bắt đầu tách", command=self.start)
@@ -585,15 +602,17 @@ class App:
         self.start_btn.configure(state="disabled")
         self.log(f"Tìm thấy {len(files)} file PDF: " + ", ".join(os.path.basename(f) for f in files))
 
+        create_folders = self.create_folders_var.get()
         thread = threading.Thread(
-            target=self.run_split, args=(files, output_dir, enabled_types, code_only), daemon=True
+            target=self.run_split, args=(files, output_dir, enabled_types, code_only, create_folders), daemon=True
         )
         thread.start()
 
-    def run_split(self, files, output_dir, enabled_types, code_only):
+    def run_split(self, files, output_dir, enabled_types, code_only, create_folders):
         try:
             splitter = PdfSplitter(
-                files, output_dir, enabled_types, self.log, self.set_progress, code_only=code_only
+                files, output_dir, enabled_types, self.log, self.set_progress,
+                code_only=code_only, create_folders=create_folders,
             )
             splitter.scan()
             self.log("Đang ghi các file kết quả...")
