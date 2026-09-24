@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import glob
 import queue
 import threading
@@ -512,11 +513,22 @@ class App:
             variable=self.create_folders_var,
         ).pack(anchor="w", padx=8, pady=(2, 6))
 
-        self.start_btn = ttk.Button(root, text="Bắt đầu tách", command=self.start)
-        self.start_btn.pack(pady=8)
+        control_frame = ttk.Frame(root)
+        control_frame.pack(pady=8)
+        self.start_btn = ttk.Button(control_frame, text="Bắt đầu tách", command=self.start)
+        self.start_btn.pack(side="left")
+        self.timer_var = tk.StringVar(value="00:00:00")
+        ttk.Label(control_frame, textvariable=self.timer_var, font=("Consolas", 11)).pack(side="left", padx=(12, 0))
 
-        self.progress = ttk.Progressbar(root, mode="determinate")
-        self.progress.pack(fill="x", padx=10, pady=(0, 8))
+        progress_frame = ttk.Frame(root)
+        progress_frame.pack(fill="x", padx=10, pady=(0, 8))
+        self.progress = ttk.Progressbar(progress_frame, mode="determinate")
+        self.progress.pack(side="left", fill="x", expand=True)
+        self.percent_var = tk.StringVar(value="0%")
+        ttk.Label(progress_frame, textvariable=self.percent_var, width=5, anchor="e").pack(side="left", padx=(8, 0))
+
+        self.timer_running = False
+        self.start_time = None
 
         self.log_box = tk.Text(root, height=20, state="disabled")
         self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -567,6 +579,25 @@ class App:
     def _set_progress(self, done, total):
         self.progress["maximum"] = total
         self.progress["value"] = done
+        percent = int(done / total * 100) if total else 0
+        self.percent_var.set(f"{percent}%")
+
+    def start_timer(self):
+        self.start_time = time.time()
+        self.timer_running = True
+        self.update_timer()
+
+    def stop_timer(self):
+        self.timer_running = False
+
+    def update_timer(self):
+        if not self.timer_running:
+            return
+        elapsed = int(time.time() - self.start_time)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        self.timer_var.set(f"{h:02d}:{m:02d}:{s:02d}")
+        self.root.after(1000, self.update_timer)
 
     def on_code_only_toggle(self):
         state = "disabled" if self.code_only_var.get() else "normal"
@@ -601,6 +632,7 @@ class App:
 
         self.start_btn.configure(state="disabled")
         self.log(f"Tìm thấy {len(files)} file PDF: " + ", ".join(os.path.basename(f) for f in files))
+        self.start_timer()
 
         create_folders = self.create_folders_var.get()
         thread = threading.Thread(
@@ -625,6 +657,7 @@ class App:
             self.log(f"Lỗi: {e}")
             self.root.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
         finally:
+            self.root.after(0, self.stop_timer)
             self.root.after(0, lambda: self.start_btn.configure(state="normal"))
 
 
