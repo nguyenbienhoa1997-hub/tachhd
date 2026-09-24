@@ -16,7 +16,12 @@ from PIL import Image
 import pytesseract
 
 INVALID_CHARS = r'<>:"/\|?*'
-CODE_PATTERN = re.compile(r"SO\s*:?\s*(\d{3,})\s*/", re.IGNORECASE)
+
+# Matches the dossier code's own distinctive shape (digits/UPPERCASE-with-dash-or-dot),
+# e.g. "50063/HDVV-KGALAXY.SAMCH2126005-KSG01" — rather than requiring the "Số:" label
+# right before it, since that label itself gets misread in inconsistent ways
+# (seen as "SO", "SÔ", "SÉ", ...) depending on the scan batch.
+CODE_PATTERN = re.compile(r"(\d{3,6})\s*/\s*[A-Z]{2,6}[-.]")
 RENDER_DPI = 150
 ROTATION_CANDIDATES = (0, 90, 180, 270)
 
@@ -265,10 +270,15 @@ class PdfSplitter:
                 return g
         return None
 
-    def resolve_forward_names(self, lookahead=3):
-        """A page can show a document's code without its name (name follows a
-        page or two later). Borrow that upcoming name so the boundary/merge
-        decision for the code-only page doesn't wrongly start a fresh group."""
+    def resolve_forward_names(self):
+        """A page can show a document's code without its name (the name might
+        only show up several pages later, e.g. after a cover/annex page).
+        Borrow that upcoming name so the boundary/merge decision for the
+        code-only page doesn't wrongly start a fresh group. There's no fixed
+        page-count limit — we keep looking as long as every page in between
+        either has no code of its own or the same (~) code, and stop the
+        moment a genuinely different code shows up, since that's a real
+        document boundary."""
         n = len(self.records)
         for i in range(n):
             my_code = self.records[i]["code"]
@@ -278,7 +288,7 @@ class PdfSplitter:
             # name from further ahead (which could belong to the next document).
             if self.records[i]["name"] or not my_code:
                 continue
-            for j in range(i + 1, min(i + 1 + lookahead, n)):
+            for j in range(i + 1, n):
                 other_code = self.records[j]["code"]
                 if other_code and not codes_probably_same(other_code, my_code):
                     break
