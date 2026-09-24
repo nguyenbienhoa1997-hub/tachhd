@@ -31,7 +31,7 @@ DOCUMENT_TYPES = {
     "phong_toa": {
         "label": "Đề nghị phong tỏa chứng khoán (tên trong đoạn văn)",
         "crop": (0.0, 0.03, 1.0, 0.45),
-        "default": True,
+        "default": False,
     },
 }
 
