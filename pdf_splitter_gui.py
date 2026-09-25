@@ -685,11 +685,14 @@ class App:
     def choose_flagged_files(self):
         paths = filedialog.askopenfilenames(
             filetypes=[("PDF files", "*.pdf")],
-            title="Chọn các file PDF bị báo sai cần tách lại",
+            title="Chọn các file PDF bị báo sai cần tách lại (chọn theo đúng thứ tự trang)",
         )
         if not paths:
             return
-        files = sorted(paths, key=natural_sort_key)
+        # Kept in selection order, not re-sorted by name/code: a stray fragment's
+        # code (or lack of one) doesn't reflect where its pages truly belong, so
+        # numeric sorting here would scramble the very order needed to re-merge them.
+        files = list(paths)
         self.selected_files = files
         self.pending_delete_files = list(files)
         self.input_var.set(f"{len(files)} file BỊ SAI cần tách lại")
@@ -708,8 +711,8 @@ class App:
         dialog.transient(self.root)
         ttk.Label(
             dialog,
-            text="Dán mỗi tên 1 dòng — có thể dán nguyên dòng báo cáo\n"
-                 "(vd: \"63838 NGUYỄN THỊ PHƯỢNG: 28 trang\") hay chỉ cần tên.",
+            text="Dán mỗi tên 1 dòng, ĐÚNG THEO THỨ TỰ TRANG cần ghép lại — có thể dán\n"
+                 "nguyên dòng báo cáo (vd: \"63838 NGUYỄN THỊ PHƯỢNG: 28 trang\") hay chỉ tên.",
         ).pack(padx=10, pady=(10, 4), anchor="w")
         text_box = tk.Text(dialog, width=60, height=10)
         text_box.pack(padx=10, pady=(0, 6))
@@ -746,7 +749,9 @@ class App:
             return
 
         if found:
-            files = sorted(set(found), key=natural_sort_key)
+            # Preserve the order the names were pasted in (not re-sorted by code) —
+            # that order is exactly how the pages should be stitched back together.
+            files = list(dict.fromkeys(found))
             self.selected_files = files
             self.pending_delete_files = list(files)
             self.input_var.set(f"{len(files)} file BỊ SAI cần tách lại (dán tên)")
