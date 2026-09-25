@@ -24,7 +24,9 @@ INVALID_CHARS = r'<>:"/\|?*'
 # misread in inconsistent ways (seen as "SO", "SÔ", "SÉ", ...) depending on the scan
 # batch. The separating "/" is matched loosely too — OCR sometimes drops it entirely
 # ("63973HDTC-..."), and the letter group can be as short as a single letter ("B-PRO").
-CODE_PATTERN = re.compile(r"(\d{3,6})[\s/\\|]{0,2}[A-Z]{1,6}[-.]")
+# The leading "(?<![\d,.])" excludes thousands-grouped money amounts like
+# "160,093,507 VND." — a real code's digits are never preceded by a comma/dot/digit.
+CODE_PATTERN = re.compile(r"(?<![\d,.])(\d{3,6})[\s/\\|]{0,2}[A-Z]{1,6}[-.]")
 RENDER_DPI = 150
 ROTATION_CANDIDATES = (0, 90, 180, 270)
 
