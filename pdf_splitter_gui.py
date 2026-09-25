@@ -26,7 +26,11 @@ INVALID_CHARS = r'<>:"/\|?*'
 # ("63973HDTC-..."), and the letter group can be as short as a single letter ("B-PRO").
 # The leading "(?<![\d,.])" excludes thousands-grouped money amounts like
 # "160,093,507 VND." — a real code's digits are never preceded by a comma/dot/digit.
-CODE_PATTERN = re.compile(r"(?<![\d,.])(\d{3,6})[\s/\\|]{0,2}[A-Z]{1,6}[-.]")
+# The trailing "[A-Z0-9]{2,}" requires something substantial after the first
+# dash/dot too — real codes keep going ("HDTC-KGALAXY...", "B-PRO..."), whereas
+# OCR garbage near a stamp/signature (e.g. "047C989999 E.P°°") or a stray "SO:"
+# misread (e.g. random noise "134 T..A") tends to fizzle out after one character.
+CODE_PATTERN = re.compile(r"(?<![\d,.])(\d{3,6})[\s/\\|]{0,2}[A-Z]{1,6}[-.][A-Z0-9]{2,}")
 RENDER_DPI = 150
 ROTATION_CANDIDATES = (0, 90, 180, 270)
 
@@ -48,8 +52,10 @@ DOCUMENT_TYPES = {
 # Different templates label the customer's name differently on page 1:
 #   "ÔNG/BÀ: TÊN"                              (hợp đồng thế chấp/vay vốn)
 #   "BÊN NHẬN BẢO ĐẢM ("..."): TÊN"            (đề nghị phong tỏa, mẫu 01K/PT)
-# Both are "label (+ optional parenthetical) : name" on one line, so they're
-# tried together as the "hop_dong" document type.
+#   "...giữa CÔNG TY CỔ PHẦN KS GROUP và TÊN"  (phụ lục "Tài Sản Thế Chấp",
+#                                                references the contract in a
+#                                                sentence instead of a label)
+# All three are tried together as the "hop_dong" document type.
 NAME_PATTERNS_HOP_DONG = [
     re.compile(
         r"(?:Ô|O)NG\s*/\s*B(?:À|A)(?:\s*/\s*C(?:Ô|O)NG\s*TY)?\s*:\s*(.+)",
@@ -57,6 +63,10 @@ NAME_PATTERNS_HOP_DONG = [
     ),
     re.compile(
         r"B[ÊE]N\s+NH[ẬA]N\s+[^:()\n]{2,30}\([^)\n]*\)\s*:\s*(.+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"GI[ỮU]A\s+C[ÔO]NG\s+TY[^)\n]*?V[ÀA]\s+([^)\n]{3,50})",
         re.IGNORECASE,
     ),
 ]
@@ -113,10 +123,11 @@ def clean_captured_name(found: str) -> str:
     found = re.split(r"[\d_|]", found)[0].strip(" .:;,\"'()-")
     # A stray mark on the page (stamp edge, pen stroke, fold...) sometimes OCRs
     # as one extra bogus single letter tacked onto the end of the name (e.g.
-    # "PHẠM THỊ THANH HƯƠNG Ĩ"). Drop it so this doesn't read as a different
-    # person than the same name read cleanly on another page.
+    # "PHẠM THỊ THANH HƯƠNG Ĩ") or a whole garbled token ("... GIÀU «\KSG").
+    # Drop trailing word(s) that aren't plain letters so this doesn't read as
+    # a different person than the same name read cleanly on another page.
     words = found.split()
-    if len(words) >= 3 and len(words[-1]) <= 1:
+    while len(words) >= 3 and (len(words[-1]) <= 1 or not words[-1].replace("-", "").isalpha()):
         words = words[:-1]
     return " ".join(words)
 
