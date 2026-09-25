@@ -383,9 +383,16 @@ class PdfSplitter:
                 self.groups_by_code[found_code] = target_group
 
         if target_group is not None:
-            if found_code and not target_group["code"]:
-                target_group["code"] = found_code
+            if found_code:
+                # Register this code as an alias for the group even when it
+                # already has a different display code — e.g. this page
+                # matched an existing group by NAME (a second dossier code
+                # for the same customer), so this code needs to keep pointing
+                # here too, or a later page bearing only this code (no name)
+                # would fail to find its way back and splinter off again.
                 self.groups_by_code[found_code] = target_group
+                if not target_group["code"]:
+                    target_group["code"] = found_code
             if found_name:
                 if not target_group["name"]:
                     target_group["name"] = found_name
@@ -469,8 +476,32 @@ class PdfSplitter:
         self.resolve_forward_codes()
         for rec in self.records:
             self.assign_page(rec["file"], rec["idx"], rec["code"], rec["name"])
+        self.merge_duplicate_name_groups()
 
         return total_pages
+
+    def merge_duplicate_name_groups(self):
+        """Two different dossier codes can legitimately belong to the same
+        customer (e.g. a separate mortgage contract and a separate loan
+        contract, each with their own code) — once a page's own code is
+        already registered to a group, later pages just keep matching that
+        group by code and never get a chance to notice a different group
+        shares the exact same name. Catch that here as a final pass: groups
+        with an identical normalized name get folded into one."""
+        seen_by_name = {}
+        merged_groups = []
+        for g in self.groups:
+            nf = normalize_name(g["name"]) if g["name"] else None
+            primary = seen_by_name.get(nf) if nf else None
+            if primary is not None:
+                primary["pages"].extend(g["pages"])
+                if not primary["code"] and g["code"]:
+                    primary["code"] = g["code"]
+            else:
+                if nf:
+                    seen_by_name[nf] = g
+                merged_groups.append(g)
+        self.groups = merged_groups
 
     def write_outputs(self):
         # When re-splitting flagged files in place, a corrected output can land
