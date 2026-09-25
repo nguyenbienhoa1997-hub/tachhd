@@ -406,8 +406,16 @@ class PdfSplitter:
         return total_pages
 
     def write_outputs(self):
+        # When re-splitting flagged files in place, a corrected output can land
+        # on the exact same path as a source file that's still open for
+        # reading (e.g. re-processing "63955 ....pdf" produces a corrected
+        # "63955 ....pdf"). Windows won't let that save overwrite a file it
+        # still has open, so every group is saved to a temp file first; only
+        # once ALL source documents are closed do the temp files get moved
+        # into their real place.
         used_folder_names = {}
         summary_lines = []
+        pending_moves = []  # (temp_path, final_path)
 
         for group in self.groups:
             if self.is_cancelled():
@@ -438,9 +446,10 @@ class PdfSplitter:
                 out_doc.insert_pdf(src_doc, from_page=page_index, to_page=page_index)
 
             out_path = os.path.join(target_dir, f"{display_name}.pdf")
-            out_doc.save(out_path)
+            temp_path = out_path + ".writing_tmp"
+            out_doc.save(temp_path)
             out_doc.close()
-            self.written_paths.append(os.path.normcase(os.path.abspath(out_path)))
+            pending_moves.append((temp_path, out_path))
 
             summary_lines.append(f"{label}: {len(group['pages'])} trang")
             self.log(f"Đã tạo: {out_path} ({len(group['pages'])} trang)")
@@ -458,9 +467,10 @@ class PdfSplitter:
                 src_doc[page_index].set_rotation(angle)
                 out_doc.insert_pdf(src_doc, from_page=page_index, to_page=page_index)
             out_path = os.path.join(unknown_dir, "Khong_xac_dinh.pdf")
-            out_doc.save(out_path)
+            temp_path = out_path + ".writing_tmp"
+            out_doc.save(temp_path)
             out_doc.close()
-            self.written_paths.append(os.path.normcase(os.path.abspath(out_path)))
+            pending_moves.append((temp_path, out_path))
             summary_lines.append(
                 f"Không xác định: {len(self.unknown_pages)} trang (không tìm thấy mã/tên trước trang này)"
             )
@@ -468,6 +478,15 @@ class PdfSplitter:
                 f"Cảnh báo: {len(self.unknown_pages)} trang không tìm thấy mã/tên khách hàng, "
                 f"đã lưu tại: {out_path}"
             )
+
+        # Release every source file handle before touching any final path.
+        for doc in self.docs.values():
+            doc.close()
+        self.docs.clear()
+
+        for temp_path, out_path in pending_moves:
+            os.replace(temp_path, out_path)
+            self.written_paths.append(os.path.normcase(os.path.abspath(out_path)))
 
         summary_path = os.path.join(self.output_dir, "BaoCao_TachFile.txt")
         with open(summary_path, "w", encoding="utf-8") as f:
