@@ -265,6 +265,7 @@ class PdfSplitter:
         self.groups_by_code = {}  # code -> group
         self.current_group = None  # where pages with no code/name of their own get appended
         self.unknown_pages = []
+        self.written_paths = []  # every output path actually written, for safe cleanup of old inputs
 
     def get_doc(self, path):
         if path not in self.docs:
@@ -438,6 +439,7 @@ class PdfSplitter:
             out_path = os.path.join(target_dir, f"{display_name}.pdf")
             out_doc.save(out_path)
             out_doc.close()
+            self.written_paths.append(os.path.normcase(os.path.abspath(out_path)))
 
             summary_lines.append(f"{label}: {len(group['pages'])} trang")
             self.log(f"Đã tạo: {out_path} ({len(group['pages'])} trang)")
@@ -457,6 +459,7 @@ class PdfSplitter:
             out_path = os.path.join(unknown_dir, "Khong_xac_dinh.pdf")
             out_doc.save(out_path)
             out_doc.close()
+            self.written_paths.append(os.path.normcase(os.path.abspath(out_path)))
             summary_lines.append(
                 f"Không xác định: {len(self.unknown_pages)} trang (không tìm thấy mã/tên trước trang này)"
             )
@@ -481,6 +484,17 @@ def find_pdf_files(folder: str):
     files = glob.glob(os.path.join(folder, "*.pdf"))
     files.sort(key=natural_sort_key)
     return files
+
+
+def guess_parent_output_dir(path: str) -> str:
+    """When re-splitting a flagged file, default the output dir one level
+    above it if it looks like it lives in its own per-customer folder
+    (i.e. "<name>/<name>.pdf") — otherwise the flagged file's own folder."""
+    folder = os.path.dirname(path)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if os.path.basename(folder) == stem:
+        return os.path.dirname(folder)
+    return folder
 
 
 APP_TITLE = "Hòa Đã Lấy Vợ"
@@ -517,6 +531,12 @@ class App:
         self.output_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.output_var, width=55).grid(row=1, column=1, sticky="we", padx=5)
         ttk.Button(frame, text="Chọn thư mục...", command=self.choose_output).grid(row=1, column=2)
+
+        self.pending_delete_files = []
+        ttk.Label(frame, text="Hoặc sửa file sai:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(
+            frame, text="Chọn file bị báo sai... (tách lại & xóa file cũ)", command=self.choose_flagged_files
+        ).grid(row=2, column=1, sticky="w", pady=(4, 0))
 
         frame.columnconfigure(1, weight=1)
 
@@ -577,6 +597,7 @@ class App:
         if paths:
             files = sorted(paths, key=natural_sort_key)
             self.selected_files = files
+            self.pending_delete_files = []
             self.input_var.set(f"{len(files)} file đã chọn")
             if not self.output_var.get():
                 self.output_var.set(os.path.join(os.path.dirname(files[0]), "Ket_qua_tach"))
@@ -586,9 +607,24 @@ class App:
         if path:
             files = find_pdf_files(path)
             self.selected_files = files
+            self.pending_delete_files = []
             self.input_var.set(f"{len(files)} file trong: {path}")
             if not self.output_var.get():
                 self.output_var.set(os.path.join(path, "Ket_qua_tach"))
+
+    def choose_flagged_files(self):
+        paths = filedialog.askopenfilenames(
+            filetypes=[("PDF files", "*.pdf")],
+            title="Chọn các file PDF bị báo sai cần tách lại",
+        )
+        if not paths:
+            return
+        files = sorted(paths, key=natural_sort_key)
+        self.selected_files = files
+        self.pending_delete_files = list(files)
+        self.input_var.set(f"{len(files)} file BỊ SAI cần tách lại")
+        if not self.output_var.get():
+            self.output_var.set(guess_parent_output_dir(files[0]))
 
     def choose_output(self):
         path = filedialog.askdirectory()
@@ -665,6 +701,16 @@ class App:
             messagebox.showerror("Lỗi", "Vui lòng chọn ít nhất 1 loại tài liệu cần nhận diện.")
             return
 
+        pending_delete = list(self.pending_delete_files)
+        if pending_delete:
+            ok = messagebox.askyesno(
+                "Xác nhận xóa file cũ",
+                f"Sau khi tách lại thành công, {len(pending_delete)} file gốc bị báo sai sẽ bị "
+                "XÓA VĨNH VIỄN (chỉ những file thực sự được thay bằng file mới). Tiếp tục?",
+            )
+            if not ok:
+                return
+
         os.makedirs(output_dir, exist_ok=True)
 
         self.start_btn.configure(state="disabled")
@@ -675,16 +721,38 @@ class App:
 
         create_folders = self.create_folders_var.get()
         thread = threading.Thread(
-            target=self.run_split, args=(files, output_dir, enabled_types, code_only, create_folders), daemon=True
+            target=self.run_split,
+            args=(files, output_dir, enabled_types, code_only, create_folders, pending_delete),
+            daemon=True,
         )
         thread.start()
+
+    def delete_replaced_files(self, flagged_files, written_paths):
+        written_set = set(written_paths)
+        removed_dirs = set()
+        for path in flagged_files:
+            norm = os.path.normcase(os.path.abspath(path))
+            if norm in written_set:
+                continue  # this exact path was just (re)written — don't delete the fresh file
+            try:
+                os.remove(path)
+                self.log(f"Đã xóa file cũ: {path}")
+                removed_dirs.add(os.path.dirname(path))
+            except OSError as e:
+                self.log(f"Không xóa được {path}: {e}")
+        for d in removed_dirs:
+            try:
+                if not os.listdir(d):
+                    os.rmdir(d)
+            except OSError:
+                pass
 
     def cancel(self):
         self.cancel_event.set()
         self.cancel_btn.configure(state="disabled")
         self.log("Đang hủy... (chờ xử lý xong trang/nhóm đang dở)")
 
-    def run_split(self, files, output_dir, enabled_types, code_only, create_folders):
+    def run_split(self, files, output_dir, enabled_types, code_only, create_folders, pending_delete):
         try:
             splitter = PdfSplitter(
                 files, output_dir, enabled_types, self.log, self.set_progress,
@@ -695,6 +763,12 @@ class App:
             self.log("Đang ghi các file kết quả...")
             num_customers = splitter.write_outputs()
             self.log(f"Hoàn tất! Đã tách thành {num_customers} khách hàng.")
+
+            if pending_delete:
+                self.log(f"Đang dọn {len(pending_delete)} file cũ bị báo sai...")
+                self.delete_replaced_files(pending_delete, splitter.written_paths)
+                self.pending_delete_files = []
+
             self.root.after(0, lambda: messagebox.showinfo(
                 "Xong", f"Đã tách thành {num_customers} khách hàng.\nLưu tại: {output_dir}"
             ))
