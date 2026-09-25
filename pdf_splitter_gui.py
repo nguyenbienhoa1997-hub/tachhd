@@ -109,6 +109,17 @@ def normalize_name(name: str) -> str:
     return name.strip()
 
 
+def names_prefix_match(a_norm: str, b_norm: str) -> bool:
+    """True if one normalized name is a leading prefix of the other — catches
+    OCR garbage stuck onto the front/back of an otherwise-correct name (e.g.
+    "DUONG MINH THUAN" vs "DUONG MINH THUAN AA") without the false-positive
+    risk of general similarity scoring, which judged unrelated people similar
+    whenever they shared the common Vietnamese ho+dem prefix."""
+    if not a_norm or not b_norm:
+        return False
+    return a_norm.startswith(b_norm) or b_norm.startswith(a_norm)
+
+
 def sanitize_filename(name: str) -> str:
     name = name.strip()
     for ch in INVALID_CHARS:
@@ -291,10 +302,16 @@ class PdfSplitter:
 
     def find_group_by_name(self, found_name):
         nf = normalize_name(found_name)
+        prefix_match = None
         for g in self.groups:
-            if g["name"] and normalize_name(g["name"]) == nf:
+            if not g["name"]:
+                continue
+            gn = normalize_name(g["name"])
+            if gn == nf:
                 return g
-        return None
+            if prefix_match is None and names_prefix_match(nf, gn):
+                prefix_match = g
+        return prefix_match
 
     def resolve_forward_names(self):
         """A page can show a document's code without its name (the name might
@@ -315,11 +332,38 @@ class PdfSplitter:
             if self.records[i]["name"] or not my_code:
                 continue
             for j in range(i + 1, n):
+                if self.records[j]["file"] != self.records[i]["file"]:
+                    break  # never borrow across a source-file boundary
                 other_code = self.records[j]["code"]
                 if other_code and not codes_probably_same(other_code, my_code):
                     break
                 if self.records[j]["name"]:
                     self.records[i]["name"] = self.records[j]["name"]
+                    break
+
+    def resolve_forward_codes(self):
+        """The mirror image of resolve_forward_names: a document's name can
+        show up on its own first page with no code nearby (the code only
+        appears a few pages later, with no name on that page). Borrow that
+        upcoming code for the name-only page, stopping the moment a
+        genuinely different (non-prefix-matching) name shows up first —
+        that's when we've actually left this document behind."""
+        n = len(self.records)
+        for i in range(n):
+            my_name = self.records[i]["name"]
+            if self.records[i]["code"] or not my_name:
+                continue
+            my_norm = normalize_name(my_name)
+            for j in range(i + 1, n):
+                if self.records[j]["file"] != self.records[i]["file"]:
+                    break  # never borrow across a source-file boundary
+                other_name = self.records[j]["name"]
+                if other_name:
+                    other_norm = normalize_name(other_name)
+                    if other_norm != my_norm and not names_prefix_match(my_norm, other_norm):
+                        break
+                if self.records[j]["code"]:
+                    self.records[i]["code"] = self.records[j]["code"]
                     break
 
     def assign_page(self, file_path, page_index, found_code, found_name):
@@ -342,8 +386,14 @@ class PdfSplitter:
             if found_code and not target_group["code"]:
                 target_group["code"] = found_code
                 self.groups_by_code[found_code] = target_group
-            if found_name and not target_group["name"]:
-                target_group["name"] = found_name
+            if found_name:
+                if not target_group["name"]:
+                    target_group["name"] = found_name
+                elif len(found_name) < len(target_group["name"]):
+                    # A prefix match means one reading has extra OCR junk stuck
+                    # on the front/back of the real name — the shorter reading
+                    # is the cleaner one, so prefer it as the display name.
+                    target_group["name"] = found_name
             target_group["pages"].append((file_path, page_index))
             self.current_group = target_group
         elif self.current_group is not None:
@@ -416,6 +466,7 @@ class PdfSplitter:
                         self.log(f"Đã xử lý {done}/{total_pages} trang...")
 
         self.resolve_forward_names()
+        self.resolve_forward_codes()
         for rec in self.records:
             self.assign_page(rec["file"], rec["idx"], rec["code"], rec["name"])
 
