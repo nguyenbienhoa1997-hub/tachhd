@@ -20,8 +20,9 @@ INVALID_CHARS = r'<>:"/\|?*'
 # Matches the dossier code's own distinctive shape (digits/UPPERCASE-with-dash-or-dot),
 # e.g. "50063/HDVV-KGALAXY.SAMCH2126005-KSG01" — rather than requiring the "Số:" label
 # right before it, since that label itself gets misread in inconsistent ways
-# (seen as "SO", "SÔ", "SÉ", ...) depending on the scan batch.
-CODE_PATTERN = re.compile(r"(\d{3,6})\s*/\s*[A-Z]{2,6}[-.]")
+# (seen as "SO", "SÔ", "SÉ", ...) depending on the scan batch. The separating "/" is
+# matched loosely too — OCR sometimes drops it entirely ("63973HDTC-...").
+CODE_PATTERN = re.compile(r"(\d{3,6})[\s/\\|]{0,2}[A-Z]{2,6}[-.]")
 RENDER_DPI = 150
 ROTATION_CANDIDATES = (0, 90, 180, 270)
 
