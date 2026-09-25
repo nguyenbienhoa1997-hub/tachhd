@@ -497,6 +497,36 @@ def guess_parent_output_dir(path: str) -> str:
     return folder
 
 
+def clean_pasted_label(line: str) -> str:
+    """Strip the "<N> trang" suffix off a pasted report line, e.g.
+    "63838 NGUYỄN THỊ PHƯỢNG: 28 trang" -> "63838 NGUYỄN THỊ PHƯỢNG"."""
+    line = line.strip().strip("-•*").strip()
+    line = re.sub(r"\s*:\s*\d+\s*trang\s*$", "", line, flags=re.IGNORECASE)
+    return line.strip()
+
+
+def resolve_label_to_path(search_dir: str, label: str):
+    """Find the actual PDF for a customer label under search_dir, whether it
+    was saved flat ("<label>.pdf") or in its own folder ("<label>/<label>.pdf"),
+    tolerating the " (2)" suffix write_outputs adds on a name collision."""
+    sanitized = sanitize_filename(label)
+    candidates = [
+        os.path.join(search_dir, f"{sanitized}.pdf"),
+        os.path.join(search_dir, sanitized, f"{sanitized}.pdf"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    for pattern in (
+        os.path.join(search_dir, f"{sanitized}*.pdf"),
+        os.path.join(search_dir, f"{sanitized}*", f"{sanitized}*.pdf"),
+    ):
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
+    return None
+
+
 APP_TITLE = "Hòa Đã Lấy Vợ"
 
 
@@ -534,9 +564,14 @@ class App:
 
         self.pending_delete_files = []
         ttk.Label(frame, text="Hoặc sửa file sai:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        flagged_btn_frame = ttk.Frame(frame)
+        flagged_btn_frame.grid(row=2, column=1, sticky="w", pady=(4, 0))
         ttk.Button(
-            frame, text="Chọn file bị báo sai... (tách lại & xóa file cũ)", command=self.choose_flagged_files
-        ).grid(row=2, column=1, sticky="w", pady=(4, 0))
+            flagged_btn_frame, text="Chọn file bị báo sai...", command=self.choose_flagged_files
+        ).pack(side="left")
+        ttk.Button(
+            flagged_btn_frame, text="Dán tên file...", command=self.paste_flagged_names
+        ).pack(side="left", padx=(4, 0))
 
         frame.columnconfigure(1, weight=1)
 
@@ -625,6 +660,62 @@ class App:
         self.input_var.set(f"{len(files)} file BỊ SAI cần tách lại")
         if not self.output_var.get():
             self.output_var.set(guess_parent_output_dir(files[0]))
+
+    def paste_flagged_names(self):
+        search_dir = self.output_var.get().strip()
+        if not search_dir or not os.path.isdir(search_dir):
+            search_dir = filedialog.askdirectory(title="Chọn thư mục chứa các file cần sửa")
+            if not search_dir:
+                return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Dán tên file bị báo sai")
+        dialog.transient(self.root)
+        ttk.Label(
+            dialog,
+            text="Dán mỗi tên 1 dòng — có thể dán nguyên dòng báo cáo\n"
+                 "(vd: \"63838 NGUYỄN THỊ PHƯỢNG: 28 trang\") hay chỉ cần tên.",
+        ).pack(padx=10, pady=(10, 4), anchor="w")
+        text_box = tk.Text(dialog, width=60, height=10)
+        text_box.pack(padx=10, pady=(0, 10))
+        text_box.focus_set()
+
+        def on_ok():
+            raw_lines = text_box.get("1.0", "end").splitlines()
+            dialog.destroy()
+            self.resolve_pasted_names(raw_lines, search_dir)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=(0, 10))
+        ttk.Button(btn_frame, text="Tìm & thêm", command=on_ok).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Hủy", command=dialog.destroy).pack(side="left", padx=4)
+
+    def resolve_pasted_names(self, raw_lines, search_dir):
+        found, missing = [], []
+        for line in raw_lines:
+            label = clean_pasted_label(line)
+            if not label:
+                continue
+            path = resolve_label_to_path(search_dir, label)
+            if path:
+                found.append(path)
+            else:
+                missing.append(label)
+
+        if not found and not missing:
+            return
+
+        if found:
+            files = sorted(set(found), key=natural_sort_key)
+            self.selected_files = files
+            self.pending_delete_files = list(files)
+            self.input_var.set(f"{len(files)} file BỊ SAI cần tách lại (dán tên)")
+
+        if missing:
+            messagebox.showwarning(
+                "Không tìm thấy",
+                "Không tìm thấy file cho các tên sau trong thư mục đã chọn:\n" + "\n".join(missing),
+            )
 
     def choose_output(self):
         path = filedialog.askdirectory()
