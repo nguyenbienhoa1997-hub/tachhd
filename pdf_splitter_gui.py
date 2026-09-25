@@ -6,6 +6,7 @@ import glob
 import queue
 import threading
 import unicodedata
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tkinter as tk
@@ -527,6 +528,18 @@ def resolve_label_to_path(search_dir: str, label: str):
     return None
 
 
+def log_flagged_report(search_dir: str, files, reason: str):
+    """Keep a running history of what got reported wrong and why, so a
+    pattern of recurring issues is easy to spot later."""
+    log_path = os.path.join(search_dir, "Lich_su_bao_loi.txt")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] Lý do: {reason or '(không ghi)'}\n")
+        for path in files:
+            f.write(f"  - {os.path.basename(path)}\n")
+        f.write("\n")
+
+
 APP_TITLE = "Hòa Đã Lấy Vợ"
 
 
@@ -677,20 +690,25 @@ class App:
                  "(vd: \"63838 NGUYỄN THỊ PHƯỢNG: 28 trang\") hay chỉ cần tên.",
         ).pack(padx=10, pady=(10, 4), anchor="w")
         text_box = tk.Text(dialog, width=60, height=10)
-        text_box.pack(padx=10, pady=(0, 10))
+        text_box.pack(padx=10, pady=(0, 6))
         text_box.focus_set()
+
+        ttk.Label(dialog, text="Lý do sai (không bắt buộc):").pack(padx=10, anchor="w")
+        reason_var = tk.StringVar()
+        ttk.Entry(dialog, textvariable=reason_var, width=60).pack(padx=10, pady=(0, 10))
 
         def on_ok():
             raw_lines = text_box.get("1.0", "end").splitlines()
+            reason = reason_var.get().strip()
             dialog.destroy()
-            self.resolve_pasted_names(raw_lines, search_dir)
+            self.resolve_pasted_names(raw_lines, search_dir, reason)
 
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(pady=(0, 10))
         ttk.Button(btn_frame, text="Tìm & thêm", command=on_ok).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Hủy", command=dialog.destroy).pack(side="left", padx=4)
 
-    def resolve_pasted_names(self, raw_lines, search_dir):
+    def resolve_pasted_names(self, raw_lines, search_dir, reason=""):
         found, missing = [], []
         for line in raw_lines:
             label = clean_pasted_label(line)
@@ -710,6 +728,8 @@ class App:
             self.selected_files = files
             self.pending_delete_files = list(files)
             self.input_var.set(f"{len(files)} file BỊ SAI cần tách lại (dán tên)")
+            log_flagged_report(search_dir, files, reason)
+            self.log(f"Đã ghi lại {len(files)} file bị báo sai vào Lich_su_bao_loi.txt")
 
         if missing:
             messagebox.showwarning(
