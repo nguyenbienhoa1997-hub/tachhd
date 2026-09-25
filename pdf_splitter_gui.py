@@ -31,7 +31,7 @@ INVALID_CHARS = r'<>:"/\|?*'
 # OCR garbage near a stamp/signature (e.g. "047C989999 E.P°°") or a stray "SO:"
 # misread (e.g. random noise "134 T..A") tends to fizzle out after one character.
 CODE_PATTERN = re.compile(r"(?<![\d,.])(\d{3,6})[\s/\\|]{0,2}[A-Z]{1,6}[-.][A-Z0-9]{2,}")
-RENDER_DPI = 150
+RENDER_DPI = 200
 ROTATION_CANDIDATES = (0, 90, 180, 270)
 
 # Each document type defines: the region of the page to OCR (as a fraction box),
@@ -129,6 +129,8 @@ def clean_captured_name(found: str) -> str:
     words = found.split()
     while len(words) >= 3 and (len(words[-1]) <= 1 or not words[-1].replace("-", "").isalpha()):
         words = words[:-1]
+    while len(words) >= 3 and (len(words[0]) <= 1 or not words[0].replace("-", "").isalpha()):
+        words = words[1:]
     return " ".join(words)
 
 
